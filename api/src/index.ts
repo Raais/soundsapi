@@ -55,4 +55,8 @@ app.get('/p/:name', (c) => {
 
 app.get('/', (c) => c.text('sound gateway alive'))
 
-export default app
+Bun.serve({
+  fetch: app.fetch,
+  port: 9567,
+  hostname: '0.0.0.0',
+})
