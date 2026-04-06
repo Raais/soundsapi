@@ -12,36 +12,57 @@ const cooldownMs = 300
 const lastPlayed: Record<string, number> = {}
 const MAX_REPEAT = 10
 
+/**
+ * Fire-and-forget playback (fast, non-blocking)
+ */
+function playNow(file: string) {
+  Bun.spawn(['paplay', file], {
+    stdout: 'ignore',
+    stderr: 'ignore',
+    stdin: 'ignore',
+    detached: true,
+  })
+}
+
 function initAudio() {
   Bun.spawn(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'], {
     stdout: 'ignore',
     stderr: 'ignore',
     stdin: 'ignore',
   })
+
+  // play startup sound
+  const file = sounds['success']
+  if (file) playNow(file)
 }
 
-async function play(file: string) {
-  const proc = Bun.spawn(['paplay', file], {
-    stdout: 'ignore',
-    stderr: 'ignore',
-    stdin: 'ignore',
-  })
-
-  const exitCode = await proc.exited
-  if (exitCode !== 0) {
-    throw new Error(`paplay exited with code ${exitCode}`)
-  }
+/**
+ * Sleep helper
+ */
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function playRepeated(file: string, count: number) {
+/**
+ * Repeat playback in background (sequential-ish)
+ */
+async function repeatInBackground(file: string, count: number, gapMs = 250) {
   for (let i = 0; i < count; i++) {
-    await play(file)
+    playNow(file)
+
+    // wait before next play (except last)
+    if (i < count - 1) {
+      await sleep(gapMs)
+    }
   }
 }
 
 initAudio()
 
-app.get('/play/:name', async (c) => {
+/**
+ * Normal play (instant response)
+ */
+app.get('/play/:name', (c) => {
   const name = c.req.param('name')
   const file = sounds[name]
 
@@ -53,14 +74,19 @@ app.get('/play/:name', async (c) => {
   }
 
   lastPlayed[name] = now
-  await play(file)
+  playNow(file)
 
   return c.text('ok')
 })
 
-app.get('/play/:name/:count', async (c) => {
+/**
+ * Repeat endpoint
+ * Example: /play/ding/3
+ */
+app.get('/play/:name/:count', (c) => {
   const name = c.req.param('name')
   const file = sounds[name]
+
   if (!file) return c.text('unknown sound', 404)
 
   const count = Number.parseInt(c.req.param('count'), 10)
@@ -69,7 +95,7 @@ app.get('/play/:name/:count', async (c) => {
   }
 
   if (count > MAX_REPEAT) {
-    return c.text(`repeat count too large (max ${MAX_REPEAT})`, 400)
+    return c.text(`repeat too large (max ${MAX_REPEAT})`, 400)
   }
 
   const now = Date.now()
@@ -78,21 +104,19 @@ app.get('/play/:name/:count', async (c) => {
   }
 
   lastPlayed[name] = now
-  await playRepeated(file, count)
+
+  // fire and forget (do NOT await)
+  repeatInBackground(file, count).catch(() => {})
 
   return c.text('ok')
 })
 
+/**
+ * Raw fire-and-forget endpoint (no cooldown)
+ */
 app.get('/p/:name', (c) => {
   const file = sounds[c.req.param('name')]
-  if (file) {
-    Bun.spawn(['paplay', file], {
-      stdout: 'ignore',
-      stderr: 'ignore',
-      stdin: 'ignore',
-      detached: true,
-    })
-  }
+  if (file) playNow(file)
   return c.body(null, 204)
 })
 
