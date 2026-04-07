@@ -1,25 +1,41 @@
 import { Hono } from 'hono'
 
-const app = new Hono()
+// --- Configuration ---
+const CONFIG = {
+  port: 9567,
+  hostname: '0.0.0.0',
+  cooldownMs: 300,
+  maxRepeat: 10,
+  repeatGapMs: 250,
+}
 
-const sounds: Record<string, string> = {
+const SOUNDS: Record<string, string> = {
   ding: '/home/raais/sounds/rcp/chime_bell_ding.wav',
   fail: '/home/raais/sounds/rcp/chime_dim.wav',
   success: '/home/raais/sounds/rcp/chime_done.wav',
 }
 
-const cooldownMs = 300
-const lastPlayed: Record<string, number> = {}
-const MAX_REPEAT = 10
+// --- State ---
+const lastPlayed = new Map<string, number>()
+
+// --- Audio Utilities ---
+
+/**
+ * Synchronously forces the sink volume to 100% to ensure 
+ * it completes before playback begins.
+ */
+function maximizeVolume() {
+  Bun.spawnSync(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'], {
+    stdout: 'ignore',
+    stderr: 'ignore',
+    stdin: 'ignore',
+  })
+}
 
 /**
  * Fire-and-forget playback (fast, non-blocking)
  */
-function playNow(file: string) {
-  // 1. Force sink volume to 100% synchronously before playing
-  Bun.spawnSync(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'])
-
-  // 2. Play the sound asynchronously
+function playAudio(file: string) {
   Bun.spawn(['paplay', file], {
     stdout: 'ignore',
     stderr: 'ignore',
@@ -28,58 +44,73 @@ function playNow(file: string) {
   })
 }
 
-function initAudio() {
-  Bun.spawn(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'], {
-    stdout: 'ignore',
-    stderr: 'ignore',
-    stdin: 'ignore',
-  })
-
-  // play startup sound
-  const file = sounds['success']
-  if (file) playNow(file)
+/**
+ * Maximizes volume and immediately plays the sound
+ */
+function playLoud(file: string) {
+  maximizeVolume()
+  playAudio(file)
 }
 
 /**
- * Sleep helper
+ * Repeat playback in background
  */
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
+async function repeatInBackground(file: string, count: number) {
+  maximizeVolume()
 
-/**
- * Repeat playback in background (sequential-ish)
- */
-async function repeatInBackground(file: string, count: number, gapMs = 250) {
   for (let i = 0; i < count; i++) {
-    playNow(file)
+    playAudio(file)
 
-    // wait before next play (except last)
+    // Wait before next play (except on the last iteration)
     if (i < count - 1) {
-      await sleep(gapMs)
+      await Bun.sleep(CONFIG.repeatGapMs)
     }
   }
 }
 
-initAudio()
+/**
+ * Checks and updates the cooldown state for a given sound.
+ * Returns true if allowed to play, false if in cooldown.
+ */
+function checkRateLimit(name: string): boolean {
+  const now = Date.now()
+  const last = lastPlayed.get(name) || 0
+  
+  if (now - last < CONFIG.cooldownMs) {
+    return false
+  }
+
+  lastPlayed.set(name, now)
+  return true
+}
+
+// --- Boot Sequence ---
+function init() {
+  maximizeVolume()
+  if (SOUNDS.success) playAudio(SOUNDS.success)
+}
+
+init()
+
+// --- Server Setup ---
+const app = new Hono()
+
+/**
+ * Health check
+ */
+app.get('/', (c) => c.text('sound gateway alive'))
 
 /**
  * Normal play (instant response)
  */
 app.get('/play/:name', (c) => {
   const name = c.req.param('name')
-  const file = sounds[name]
+  const file = SOUNDS[name]
 
   if (!file) return c.text('unknown sound', 404)
+  if (!checkRateLimit(name)) return c.text('cooldown', 429)
 
-  const now = Date.now()
-  if (now - (lastPlayed[name] || 0) < cooldownMs) {
-    return c.text('cooldown')
-  }
-
-  lastPlayed[name] = now
-  playNow(file)
-
+  playLoud(file)
   return c.text('ok')
 })
 
@@ -89,28 +120,24 @@ app.get('/play/:name', (c) => {
  */
 app.get('/play/:name/:count', (c) => {
   const name = c.req.param('name')
-  const file = sounds[name]
+  const file = SOUNDS[name]
 
   if (!file) return c.text('unknown sound', 404)
 
-  const count = Number.parseInt(c.req.param('count'), 10)
+  const count = parseInt(c.req.param('count'), 10)
+  
   if (!Number.isInteger(count) || count < 1) {
     return c.text('invalid repeat count', 400)
   }
 
-  if (count > MAX_REPEAT) {
-    return c.text(`repeat too large (max ${MAX_REPEAT})`, 400)
+  if (count > CONFIG.maxRepeat) {
+    return c.text(`repeat too large (max ${CONFIG.maxRepeat})`, 400)
   }
 
-  const now = Date.now()
-  if (now - (lastPlayed[name] || 0) < cooldownMs) {
-    return c.text('cooldown')
-  }
+  if (!checkRateLimit(name)) return c.text('cooldown', 429)
 
-  lastPlayed[name] = now
-
-  // fire and forget (do NOT await)
-  repeatInBackground(file, count).catch(() => {})
+  // Fire and forget (catch errors to prevent unhandled rejections crashing the process)
+  repeatInBackground(file, count).catch(console.error)
 
   return c.text('ok')
 })
@@ -119,15 +146,15 @@ app.get('/play/:name/:count', (c) => {
  * Raw fire-and-forget endpoint (no cooldown)
  */
 app.get('/p/:name', (c) => {
-  const file = sounds[c.req.param('name')]
-  if (file) playNow(file)
+  const file = SOUNDS[c.req.param('name')]
+  if (file) playLoud(file)
+  
   return c.body(null, 204)
 })
 
-app.get('/', (c) => c.text('sound gateway alive'))
-
-Bun.serve({
+// Using Bun's default export pattern for servers
+export default {
   fetch: app.fetch,
-  port: 9567,
-  hostname: '0.0.0.0',
-})
+  port: CONFIG.port,
+  hostname: CONFIG.hostname,
+}
