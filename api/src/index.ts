@@ -16,6 +16,10 @@ const MAX_REPEAT = 10
  * Fire-and-forget playback (fast, non-blocking)
  */
 function playNow(file: string) {
+  // 1. Force sink volume to 100% synchronously before playing
+  Bun.spawnSync(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%'])
+
+  // 2. Play the sound asynchronously
   Bun.spawn(['paplay', file], {
     stdout: 'ignore',
     stderr: 'ignore',
