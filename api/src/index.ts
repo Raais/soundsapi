@@ -152,9 +152,9 @@ app.get('/p/:name', (c) => {
   return c.body(null, 204)
 })
 
-// Using Bun's default export pattern for servers
-export default {
+// Start the server
+Bun.serve({
   fetch: app.fetch,
   port: CONFIG.port,
   hostname: CONFIG.hostname,
-}
+})
